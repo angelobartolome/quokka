@@ -15,7 +15,14 @@ autobins = false
 # nothing here is a library people should depend on. Setting publish to
 # false keeps `FakeDevice`, the `Device` trait, and `pub mod bench` from
 # becoming a de-facto stable API via `cargo install quokka-cli`.
+#
+# `cargo-dist` interprets `publish = false` as "skip this package", which
+# breaks the release pipeline. The override below tells dist to keep
+# building binaries for it.
 publish = false
+
+[package.metadata.dist]
+dist = true
 
 [lib]
 name = "quokka_cli"
