@@ -313,17 +313,8 @@ fn format_relative_date(unix: i64, now_unix: i64) -> String {
 /// Uses the well-known days-from-civil algorithm so we don't need a date
 /// crate for the one place the dashboard formats absolute dates.
 fn year_month_utc(unix: i64) -> (i64, i64) {
-    let days = unix.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month)
+    let (year, month, _, _, _, _) = crate::ui::civil_from_unix(unix);
+    (year as i64, month as i64)
 }
 
 fn colour_for_usage(percent: u8, text: String) -> String {

@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, global = true, env = "QK_UDID")]
     udid: Option<String>,
 
+    /// Emit machine-readable JSON instead of the human dashboard. Currently
+    /// honored by `info` and `devices`; other subcommands ignore it.
+    #[arg(long, global = true)]
+    json: bool,
+
     // Optional so `quokka`/`qk` with no args opens the interactive
     // launcher on a TTY. Non-TTY callers (pipes/CI) fall back to `--help`.
     #[command(subcommand)]
@@ -147,16 +152,21 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // `qk devices` is the one subcommand that does not select a device.
+    // `qk devices` is the one subcommand that does not select a device,
+    // so handle it before reaching for the connection.
     if matches!(cli.command, Some(Command::Devices)) {
-        return commands::devices::run().await;
+        return commands::devices::run(cli.json).await;
     }
 
     let device = device::connect(cli.udid.as_deref()).await?;
 
     match cli.command {
         None => commands::menu::run(&*device).await,
-        Some(Command::Devices) => unreachable!("handled above"),
+        Some(Command::Devices) => {
+            // Already handled above; keeping the arm satisfies the
+            // exhaustiveness check without an unreachable!().
+            Ok(())
+        }
         Some(Command::Status) => commands::status::run(&*device).await,
         Some(Command::Apps { uninstall, yes }) => {
             commands::apps::run(
@@ -171,7 +181,7 @@ pub async fn run() -> Result<()> {
         Some(Command::Analyze { top, delete }) => {
             commands::analyze::run(&*device, top, delete).await
         }
-        Some(Command::Info { redact }) => commands::info::run(&*device, redact).await,
+        Some(Command::Info { redact }) => commands::info::run(&*device, redact, cli.json).await,
         Some(Command::Reboot { yes }) => {
             commands::power::run(&*device, commands::power::Action::Reboot, yes).await
         }

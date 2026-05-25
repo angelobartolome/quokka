@@ -22,7 +22,13 @@ env:
 jobs:
   test:
     # quokka is a macOS tool (it talks to usbmuxd); CI runs on macOS to match.
-    runs-on: macos-latest
+    # Release ships both x86_64 and aarch64 darwin, so test both — `macos-14`
+    # is Apple Silicon, `macos-13` is the last x86_64 image GitHub offers.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-13]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 

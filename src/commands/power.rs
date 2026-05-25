@@ -43,16 +43,20 @@ fn labels(action: Action) -> &'static ActionLabels {
 
 pub async fn run(device: &dyn Device, action: Action, yes: bool) -> Result<()> {
     let labels = labels(action);
-    let status = device.status().await.ok();
-
-    if !yes && !std::io::stdout().is_terminal() {
-        bail!(
-            "refusing to run a destructive action without confirmation. \
-             Re-run with `--yes` or run from an interactive terminal."
-        );
-    }
 
     if !yes {
+        // The confirm prompt reads stdin, so that's the stream that has to
+        // be a TTY. Checking stdout was a bug: `qk reboot | tee` in an
+        // interactive shell would refuse even though the user could type.
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "refusing to run a destructive action without confirmation. \
+                 Re-run with `--yes` or run from an interactive terminal."
+            );
+        }
+        // Read status only when we'll actually use it for the prompt label.
+        // With `--yes` we skip the extra lockdown round-trip entirely.
+        let status = device.status().await.ok();
         let prompt = build_confirm_prompt(labels.confirm_verb, status.as_ref());
         let confirmed = Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(prompt)

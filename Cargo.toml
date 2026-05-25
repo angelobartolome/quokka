@@ -11,6 +11,11 @@ keywords = ["ios", "iphone", "cli", "idevice", "usbmuxd"]
 categories = ["command-line-utilities"]
 # Disable bin auto-discovery so we control both `quokka` and `qk` explicitly.
 autobins = false
+# Distribution is via Homebrew and the curl installer (see release.yml);
+# nothing here is a library people should depend on. Setting publish to
+# false keeps `FakeDevice`, the `Device` trait, and `pub mod bench` from
+# becoming a de-facto stable API via `cargo install quokka-cli`.
+publish = false
 
 [lib]
 name = "quokka_cli"
@@ -46,7 +51,12 @@ idevice = { version = "=0.1.61", default-features = false, features = [
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
+thiserror = "1"
 async-trait = "0.1"
+# JSON output for `--json` on `qk info` / `qk devices`. Other commands
+# still print plain text; expanding coverage is a follow-up.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # `FuturesUnordered` for bounded-concurrency batched lookups.
 futures = "0.3"
 # Used directly to type plist values returned from `idevice` (which depends
@@ -68,6 +78,9 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# Inline snapshots for render functions — locks in the printed layout so
+# accidental column-width or row-order changes fail loudly.
+insta = "1"
 
 # Generate this profile section with `dist init`; it controls the release
 # binary's size + speed when shipped via Homebrew / curl installer.

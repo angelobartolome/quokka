@@ -19,6 +19,7 @@ use crate::ui::{now_unix, spinner, terminal_width};
 const TAGLINE: &str = "Inspect and tidy your iPhone from the Mac";
 const AUTHOR: &str = "by Lucas Dutra";
 
+#[derive(Clone, Copy)]
 enum Choice {
     Apps,
     Analyze,
@@ -55,33 +56,38 @@ pub async fn run(device: &dyn Device) -> Result<()> {
         writeln!(out)?;
         out.flush()?;
 
-        let items = [
-            format!("{:<10} {}", "Apps", "List & uninstall user apps"),
-            format!("{:<10} {}", "Analyze", "Find the heaviest media files"),
-            format!("{:<10} {}", "Media", "Survey camera roll & downloads"),
-            format!("{:<10} {}", "Logs", "Stream device syslog"),
-            format!("{:<10} {}", "Info", "Print device identity"),
-            format!("{:<10} {}", "Refresh", "Re-read device info"),
-            format!("{:<10} {}", "Reboot", "Restart the device"),
-            format!("{:<10} {}", "Shutdown", "Power off the device"),
-            "Quit".to_string(),
+        // Single source of truth — labels and choices stay aligned even when
+        // a new entry is inserted in the middle. The old code hard-coded
+        // `Some(8) => Quit` and would silently misroute on additions.
+        let menu: &[(&str, &str, Choice)] = &[
+            ("Apps", "List & uninstall user apps", Choice::Apps),
+            ("Analyze", "Find the heaviest media files", Choice::Analyze),
+            ("Media", "Survey camera roll & downloads", Choice::Media),
+            ("Logs", "Stream device syslog", Choice::Logs),
+            ("Info", "Print device identity", Choice::Info),
+            ("Refresh", "Re-read device info", Choice::Refresh),
+            ("Reboot", "Restart the device", Choice::Reboot),
+            ("Shutdown", "Power off the device", Choice::Shutdown),
+            ("Quit", "", Choice::Quit),
         ];
+        let items: Vec<String> = menu
+            .iter()
+            .map(|(label, desc, _)| {
+                if desc.is_empty() {
+                    (*label).to_string()
+                } else {
+                    format!("{:<10} {}", label, desc)
+                }
+            })
+            .collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
             .items(&items)
             .default(0)
             .interact_opt()?;
 
         let choice = match selection {
-            None | Some(8) => Choice::Quit,
-            Some(0) => Choice::Apps,
-            Some(1) => Choice::Analyze,
-            Some(2) => Choice::Media,
-            Some(3) => Choice::Logs,
-            Some(4) => Choice::Info,
-            Some(5) => Choice::Refresh,
-            Some(6) => Choice::Reboot,
-            Some(7) => Choice::Shutdown,
-            Some(_) => unreachable!(),
+            None => Choice::Quit,
+            Some(i) => menu.get(i).map(|(_, _, c)| *c).unwrap_or(Choice::Quit),
         };
 
         match choice {
@@ -100,7 +106,7 @@ pub async fn run(device: &dyn Device) -> Result<()> {
             Choice::Analyze => analyze::run(device, 20, true).await?,
             Choice::Media => media::run(device, false).await?,
             Choice::Logs => logs::run(device, logs::Options::default()).await?,
-            Choice::Info => info::run(device, false).await?,
+            Choice::Info => info::run(device, false, false).await?,
             Choice::Reboot => power::run(device, power::Action::Reboot, false).await?,
             Choice::Shutdown => power::run(device, power::Action::Shutdown, false).await?,
         }

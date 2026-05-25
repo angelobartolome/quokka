@@ -331,7 +331,65 @@ async fn analyze_top_larger_than_files_saturates_through_run() {
 #[tokio::test]
 async fn info_command_runs_against_fake_default() {
     let fake = FakeDevice::default();
-    commands::info::run(&fake, false).await.expect("info ok");
+    commands::info::run(&fake, false, false)
+        .await
+        .expect("info ok");
+}
+
+/// Snapshot of the plain `render_network_block` output. Locks layout so a
+/// future column-width or ordering change in the renderer fails loudly
+/// instead of silently shifting the user-facing format.
+#[tokio::test]
+async fn info_network_block_layout_snapshot() {
+    let fake = FakeDevice::default();
+    let info = fake.info().await.unwrap();
+    let block = quokka_cli::commands::info::render_network_block(&info, false)
+        .expect("network block should render with the default fake");
+    insta::assert_snapshot!(block, @r"
+    Network
+      Wi-Fi MAC         AA:BB:CC:DD:EE:FF
+      Bluetooth MAC     AA:BB:CC:DD:EE:F0
+      IMEI              350123456789012
+      IMEI 2            350123456789013
+    ");
+}
+
+/// Snapshot of the JSON output of `qk info --json`. Locks both shape and
+/// key ordering so downstream scripts can rely on the format.
+#[tokio::test]
+async fn info_json_output_snapshot() {
+    let fake = FakeDevice::default();
+    let info = fake.info().await.unwrap();
+    let json = quokka_cli::commands::info::render_json(&info, false);
+    insta::assert_snapshot!(json, @r#"
+    {
+      "device": {
+        "enclosure_color": "Natural Titanium",
+        "model_friendly": "iPhone 15 Pro Max",
+        "model_identifier": "iPhone16,2",
+        "model_number": "MQ8X3LL/A",
+        "name": "Lucas's iPhone",
+        "region_info": "LL/A",
+        "serial": "F2LXXXXXXXXX",
+        "udid": "00008130-001A2B3C4D5E6F7G"
+      },
+      "network": {
+        "bluetooth_address": "AA:BB:CC:DD:EE:F0",
+        "imei": "350123456789012",
+        "imei2": "350123456789013",
+        "wifi_address": "AA:BB:CC:DD:EE:FF"
+      },
+      "system": {
+        "activation_state": "Activated",
+        "cpu_architecture": "arm64e",
+        "developer_mode_enabled": false,
+        "hardware_model": "D74AP",
+        "ios_build": "22C152",
+        "ios_version": "18.2",
+        "is_supervised": false
+      }
+    }
+    "#);
 }
 
 #[tokio::test]

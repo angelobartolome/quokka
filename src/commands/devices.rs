@@ -8,11 +8,35 @@ use owo_colors::OwoColorize;
 
 use crate::device::{list_devices, DeviceListing};
 
-pub async fn run() -> Result<()> {
+pub async fn run(json: bool) -> Result<()> {
     let listings = list_devices().await?;
     let mut out = anstream::stdout();
-    write!(out, "{}", format_listings(&listings))?;
+    if json {
+        write!(out, "{}", render_json(&listings))?;
+    } else {
+        write!(out, "{}", format_listings(&listings))?;
+    }
     Ok(())
+}
+
+fn render_json(listings: &[DeviceListing]) -> String {
+    // Hand-rolled object so we don't have to put `Serialize` on every domain
+    // type — keeps the JSON shape decoupled from the internal struct.
+    let array: Vec<serde_json::Value> = listings
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "udid": d.udid,
+                "connection": d.connection,
+                "name": d.name,
+                "model_identifier": d.model_identifier,
+                "model_friendly": d.model_friendly,
+            })
+        })
+        .collect();
+    let mut s = serde_json::to_string_pretty(&array).unwrap_or_else(|_| "[]".to_string());
+    s.push('\n');
+    s
 }
 
 /// Pure formatter shared by `run` and the unit tests: yields the

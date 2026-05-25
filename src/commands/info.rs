@@ -11,15 +11,55 @@ use crate::ui::spinner;
 const LABEL_WIDTH: usize = 18;
 const REDACT_VISIBLE_TAIL: usize = 4;
 
-pub async fn run(device: &dyn Device, redact: bool) -> Result<()> {
+pub async fn run(device: &dyn Device, redact: bool, json: bool) -> Result<()> {
     let bar = spinner("Reading device info...");
     let info = device.info().await;
     bar.finish_and_clear();
     let info = info?;
 
     let mut out = anstream::stdout();
-    write!(out, "{}", render(&info, redact))?;
+    if json {
+        write!(out, "{}", render_json(&info, redact))?;
+    } else {
+        write!(out, "{}", render(&info, redact))?;
+    }
     Ok(())
+}
+
+/// JSON serialisation of [`DeviceInfo`]. Honors `--redact` exactly like the
+/// human renderer — the masked form is what lands in the JSON too.
+pub fn render_json(info: &DeviceInfo, redact: bool) -> String {
+    let mask = |v: &str| maybe_redact(v, redact);
+    let v = serde_json::json!({
+        "device": {
+            "name": info.name,
+            "model_identifier": info.model_identifier,
+            "model_friendly": info.model_friendly,
+            "model_number": info.model_number,
+            "region_info": info.region_info,
+            "enclosure_color": info.enclosure_color,
+            "serial": mask(&info.serial),
+            "udid": mask(&info.udid),
+        },
+        "system": {
+            "ios_version": info.ios_version,
+            "ios_build": info.ios_build,
+            "hardware_model": info.hardware_model,
+            "cpu_architecture": info.cpu_architecture,
+            "activation_state": info.activation_state,
+            "is_supervised": info.is_supervised,
+            "developer_mode_enabled": info.developer_mode_enabled,
+        },
+        "network": {
+            "wifi_address": info.wifi_address.as_deref().map(mask),
+            "bluetooth_address": info.bluetooth_address.as_deref().map(mask),
+            "imei": info.imei.as_deref().map(mask),
+            "imei2": info.imei2.as_deref().map(mask),
+        },
+    });
+    let mut s = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string());
+    s.push('\n');
+    s
 }
 
 pub fn render(info: &DeviceInfo, redact: bool) -> String {
@@ -131,20 +171,18 @@ fn maybe_redact(value: &str, redact: bool) -> String {
     }
 }
 
+/// Mask `value` to a fixed-width form `***…XXXX` that keeps the last
+/// `visible_tail` characters but hides the original length. Previously the
+/// number of stars matched the source length, which leaked field length
+/// (low-grade signal for some keys, but no reason to keep when redacting).
 pub fn redact_tail(value: &str, visible_tail: usize) -> String {
     let chars: Vec<char> = value.chars().collect();
     let len = chars.len();
     if len <= visible_tail {
         return "*".repeat(len);
     }
-    let mut s = String::with_capacity(len);
-    for _ in 0..(len - visible_tail) {
-        s.push('*');
-    }
-    for ch in &chars[len - visible_tail..] {
-        s.push(*ch);
-    }
-    s
+    let tail: String = chars[len - visible_tail..].iter().collect();
+    format!("***…{tail}")
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -217,8 +255,11 @@ mod tests {
 
     #[test]
     fn redact_tail_keeps_last_n_chars() {
-        assert_eq!(redact_tail("350123456789012", 4), "***********9012");
-        assert_eq!(redact_tail("AA:BB:CC:DD:EE:FF", 4), "*************E:FF");
+        // Fixed-width prefix (`***…`) hides the original length while still
+        // showing the last `n` chars. Inputs shorter than the tail mask
+        // every char to avoid revealing the suffix's identity.
+        assert_eq!(redact_tail("350123456789012", 4), "***…9012");
+        assert_eq!(redact_tail("AA:BB:CC:DD:EE:FF", 4), "***…E:FF");
         assert_eq!(redact_tail("abc", 4), "***");
         assert_eq!(redact_tail("", 4), "");
     }

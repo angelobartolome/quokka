@@ -102,23 +102,7 @@ fn format_iso8601(ts_ms: Option<i64>) -> String {
 }
 
 fn unix_to_ymd_hms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400) as u32;
-    let hh = rem / 3600;
-    let mm = (rem / 60) % 60;
-    let ss = rem % 60;
-    // Civil-from-days (Hinnant).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i32, m as u32, d as u32, hh, mm, ss)
+    crate::ui::civil_from_unix(secs)
 }
 
 pub mod parser {
@@ -381,22 +365,34 @@ mod tui {
             }
         }
 
+        /// Rows visible in the viewport: pass the level + process filter
+        /// AND match the active search needle. Search used to only
+        /// highlight matches without removing non-matching rows, which
+        /// surprised users who treated the field as a filter.
         fn filtered(&self) -> Vec<&LogEntry> {
+            let needle = if self.search.is_empty() {
+                None
+            } else {
+                Some(self.search.to_lowercase())
+            };
             self.buffer
                 .iter()
                 .filter(|e| matches_filter(e, &self.filter))
+                .filter(|e| match needle.as_deref() {
+                    Some(n) => row_matches_search(e, n),
+                    None => true,
+                })
                 .collect()
         }
 
+        /// Number of rows the active search is matching — when search is
+        /// inactive, returns 0 so the header omits the "N matched" segment.
         fn match_count(&self) -> usize {
             if self.search.is_empty() {
-                return 0;
+                0
+            } else {
+                self.filtered().len()
             }
-            let needle = self.search.to_lowercase();
-            self.filtered()
-                .iter()
-                .filter(|e| row_matches_search(e, &needle))
-                .count()
         }
 
         fn cycle_level(&mut self) {
@@ -879,6 +875,83 @@ mod tui {
         );
     }
 
+    /// Append `msg` to `spans` with case-insensitive highlights on every
+    /// match of `needle_lower`. Iterates by character so the slicing always
+    /// hits valid UTF-8 boundaries — `String::to_lowercase` can change byte
+    /// length (e.g. `'İ'` → `"i\u{307}"`), which makes naive `find` + byte
+    /// indexing on the original string panic on multibyte input.
+    pub(super) fn push_highlighted_message(
+        spans: &mut Vec<Span<'static>>,
+        msg: &str,
+        needle_lower: &str,
+        row_style: Style,
+    ) {
+        let highlight = Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let needle_chars: Vec<char> = needle_lower.chars().collect();
+        if needle_chars.is_empty() {
+            spans.push(Span::styled(msg.to_string(), row_style));
+            return;
+        }
+        let chars: Vec<(usize, char)> = msg.char_indices().collect();
+        let mut segment_start = 0usize;
+        let mut idx = 0usize;
+        while idx < chars.len() {
+            if let Some(match_end_char) = match_at(&chars, idx, &needle_chars) {
+                let match_start_byte = chars[idx].0;
+                let match_end_byte = chars
+                    .get(match_end_char)
+                    .map(|(b, _)| *b)
+                    .unwrap_or(msg.len());
+                if match_start_byte > segment_start {
+                    spans.push(Span::styled(
+                        msg[segment_start..match_start_byte].to_string(),
+                        row_style,
+                    ));
+                }
+                spans.push(Span::styled(
+                    msg[match_start_byte..match_end_byte].to_string(),
+                    highlight,
+                ));
+                segment_start = match_end_byte;
+                idx = match_end_char;
+            } else {
+                idx += 1;
+            }
+        }
+        if segment_start < msg.len() {
+            spans.push(Span::styled(msg[segment_start..].to_string(), row_style));
+        }
+    }
+
+    /// Returns the (exclusive) character index after the match if
+    /// `needle_chars` matches `chars` starting at `start`, comparing each
+    /// character lowercased. `None` otherwise.
+    fn match_at(chars: &[(usize, char)], start: usize, needle_chars: &[char]) -> Option<usize> {
+        let mut ni = 0usize;
+        let mut ci = start;
+        while ni < needle_chars.len() {
+            let (_, ch) = chars.get(ci)?;
+            // Compare lowercase forms one character at a time. `char::to_lowercase`
+            // can produce multiple characters for a single source char; reject
+            // those here so we never split a grapheme weirdly — losing a rare
+            // match is better than a panic.
+            let mut lowered = ch.to_lowercase();
+            let first = lowered.next()?;
+            if lowered.next().is_some() {
+                return None;
+            }
+            if first != needle_chars[ni] {
+                return None;
+            }
+            ni += 1;
+            ci += 1;
+        }
+        Some(ci)
+    }
+
     fn row_matches_search(entry: &LogEntry, needle_lower: &str) -> bool {
         entry.message.to_lowercase().contains(needle_lower)
             || entry.process.to_lowercase().contains(needle_lower)
@@ -968,31 +1041,7 @@ mod tui {
         let msg = &entry.message;
         let needle_l = needle.map(|n| n.to_lowercase()).filter(|n| !n.is_empty());
         if let Some(needle_l) = needle_l {
-            let lower = msg.to_lowercase();
-            let mut i = 0;
-            while i < msg.len() {
-                match lower[i..].find(&needle_l) {
-                    Some(off) => {
-                        let start = i + off;
-                        let end = start + needle_l.len();
-                        if start > i {
-                            spans.push(Span::styled(msg[i..start].to_string(), row_style));
-                        }
-                        spans.push(Span::styled(
-                            msg[start..end].to_string(),
-                            Style::default()
-                                .bg(Color::Yellow)
-                                .fg(Color::Black)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        i = end;
-                    }
-                    None => {
-                        spans.push(Span::styled(msg[i..].to_string(), row_style));
-                        break;
-                    }
-                }
-            }
+            push_highlighted_message(&mut spans, msg, &needle_l, row_style);
         } else {
             spans.push(Span::styled(msg.clone(), row_style));
         }
@@ -1038,6 +1087,24 @@ mod tests {
             level,
             message: "msg".into(),
         }
+    }
+
+    #[test]
+    fn push_highlighted_message_does_not_panic_on_multibyte_input() {
+        // Regression: `'İ'.to_lowercase()` yields `"i\u{307}"` (2 chars).
+        // The previous implementation used byte offsets from a lowercased
+        // copy to slice the original message, which panicked on non-ASCII.
+        let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+        super::tui::push_highlighted_message(
+            &mut spans,
+            "İstanbul SpringBoard log message",
+            "istanbul",
+            ratatui::style::Style::default(),
+        );
+        assert!(
+            !spans.is_empty(),
+            "highlight must produce at least one span"
+        );
     }
 
     #[test]

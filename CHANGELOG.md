@@ -7,6 +7,30 @@ and this project aims to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Crash in `qk logs` search highlighting when the message contained
+  characters whose lowercase form has a different byte length than the
+  uppercase form (e.g. Turkish `İ`).
+- `qk reboot` / `qk shutdown` checked the wrong stream for a TTY (stdout
+  instead of stdin), which could falsely refuse to confirm when stdout was
+  piped but stdin was interactive.
+- `qk apps` would abort the whole app-size enrichment on the first failing
+  batch instead of treating later batches as best-effort.
+- `--udid <wifi-udid>` failed when another USB device was also connected;
+  the USB-only filter is now skipped when the user names a UDID explicitly.
+
+### Changed
+
+- `analyze --delete` confirmation now defaults to "no" so a bare Enter no
+  longer deletes files.
+- `analyze` top-N selection switched to a fixed-size min-heap (O(N log K))
+  for cheaper scans on devices with very large media libraries.
+- `qk reboot` / `qk shutdown` no longer make an extra lockdown round-trip
+  when `--yes` is set.
+
+## [0.1.0] - MVP
+
 The MVP. quokka talks to an iPhone connected over USB to a Mac, using only
 lockdown-classic services — no jailbreak, no elevated privileges.
 

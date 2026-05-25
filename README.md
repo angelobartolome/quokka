@@ -18,26 +18,12 @@ and works on iOS 17 and newer.
 ## ⚡ Quick start
 
 ```sh
-brew install dutradotdev/tap/quokka
+brew install dutradotdev/tap/quokka-cli
 qk
 ```
 
 With no arguments, `qk` opens the interactive launcher. See [Install](#install)
 below for `curl` and `cargo` alternatives.
-
-## Demo
-
-<!--
-Replace the placeholder URL below with a real upload:
-  1. Open any issue or PR on github.com/dutradotdev/quokka
-  2. Drag a .mp4/.mov/.gif into the comment box (do NOT submit the comment)
-  3. GitHub uploads it and replaces the drag with a `https://github.com/user-attachments/assets/<uuid>` link
-  4. Copy that URL into the `src=` below, then delete this comment block
--->
-
-<video src="https://user-images.githubusercontent.com/PLACEHOLDER/quokka-uninstall-demo.mp4" controls autoplay muted loop width="720">
-  Uninstalling an iPhone app from the terminal with <code>qk apps</code>.
-</video>
 
 ## Dashboard preview
 
@@ -63,18 +49,18 @@ interactive menu:
 
 ## Commands
 
-| Command           | What it does                                                                                          |
-| ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `quokka`          | Interactive launcher. Dashboard plus a menu to jump into any command below.                           |
-| `quokka status`   | Print the device dashboard once.                                                                      |
+| Command           | What it does                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `quokka`          | Interactive launcher. Dashboard plus a menu to jump into any command below.                                                     |
+| `quokka status`   | Print the device dashboard once.                                                                                                |
 | `quokka info`     | Static identity in three blocks (Device / System / Network). `--redact` masks serial, UDID, IMEI, and MAC for safe screenshots. |
-| `quokka apps`     | Picker of installed user apps by size. `--uninstall <bundle-id>` removes one directly.                |
-| `quokka analyze`  | Walk media folders and surface the heaviest files. Read-only by default; `--delete` opens a picker.   |
-| `quokka media`    | Survey camera roll and downloads. Per-kind counts, per-month breakdown, top-10 largest. `-d` adds likely-duplicate groups. |
-| `quokka logs`     | Stream the device's syslog in a TUI viewer. Filter by level or process, search, pause, save. `--no-tui` streams plain stdout. |
-| `quokka reboot`   | Soft reboot via `diagnostics_relay`. Confirms by default; `--yes` skips.                              |
-| `quokka shutdown` | Power off via `diagnostics_relay`. Confirms by default; `--yes` skips.                                |
-| `quokka devices`  | List every iPhone reachable through `usbmuxd`. Does not select one.                                   |
+| `quokka apps`     | Picker of installed user apps by size. `--uninstall <bundle-id>` removes one directly.                                          |
+| `quokka analyze`  | Walk media folders and surface the heaviest files. Read-only by default; `--delete` opens a picker.                             |
+| `quokka media`    | Survey camera roll and downloads. Per-kind counts, per-month breakdown, top-10 largest. `-d` adds likely-duplicate groups.      |
+| `quokka logs`     | Stream the device's syslog in a TUI viewer. Filter by level or process, search, pause, save. `--no-tui` streams plain stdout.   |
+| `quokka reboot`   | Soft reboot via `diagnostics_relay`. Confirms by default; `--yes` skips.                                                        |
+| `quokka shutdown` | Power off via `diagnostics_relay`. Confirms by default; `--yes` skips.                                                          |
+| `quokka devices`  | List every iPhone reachable through `usbmuxd`. Does not select one.                                                             |
 
 ## Examples
 
@@ -124,15 +110,16 @@ qk info                                 # 2+ devices on a TTY: opens an interact
 qk info                                 # 2+ devices in a pipe/CI without --udid: errors with a hint
 ```
 
-`--udid` / `-d` is a global flag that works on every subcommand. It also reads
-from `QK_UDID` in the environment, so you can set it once per shell.
+`--udid` is a global flag that works on every subcommand (long-only — there is
+no `-d` short form because `qk media -d` already means `--find-duplicates`). It
+also reads from `QK_UDID` in the environment, so you can set it once per shell.
 
 ## Requirements
 
 - A Mac with the Xcode command line tools (`xcode-select --install`).
 - An iPhone connected via cable. Wi-Fi pairing is out of scope.
 - The device must be trusted. The first time you plug it in, unlock the iPhone
-  and tap *Trust this computer*.
+  and tap _Trust this computer_.
 - iOS 17 or newer.
 
 ## Install

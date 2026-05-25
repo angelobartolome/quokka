@@ -74,9 +74,26 @@ pub fn sort_by_size(mut files: Vec<MediaFile>) -> Vec<MediaFile> {
 }
 
 pub fn top_n_by_size(files: Vec<MediaFile>, top: usize) -> Vec<MediaFile> {
-    let mut sorted = sort_by_size(files);
-    sorted.truncate(top);
-    sorted
+    // O(N log K) via min-heap of size K instead of O(N log N) full sort —
+    // matters on large media libraries where the read-only path only ever
+    // shows the top 20.
+    if top == 0 {
+        return Vec::new();
+    }
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    // Min-heap (smallest size at the top) via Reverse on a max-heap.
+    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::with_capacity(top + 1);
+    for (i, f) in files.iter().enumerate() {
+        heap.push(Reverse((f.size_bytes, i)));
+        if heap.len() > top {
+            heap.pop();
+        }
+    }
+    let mut indices: Vec<(u64, usize)> = heap.into_iter().map(|r| r.0).collect();
+    // Heap order is not sorted — sort the survivors descending for output.
+    indices.sort_by_key(|b| Reverse(b.0));
+    indices.into_iter().map(|(_, i)| files[i].clone()).collect()
 }
 
 pub(crate) fn ext_lower(path: &str) -> String {
@@ -150,9 +167,11 @@ pub fn build_confirm_prompt(picked: &[MediaFile]) -> String {
 
 async fn confirm_and_delete(device: &dyn Device, picked: &[MediaFile]) -> Result<()> {
     let mut out = anstream::stdout();
+    // Destructive default: `false`. Matches `power.rs`; the user must
+    // explicitly press `y`. Avoids an accidental Enter deleting files.
     let confirmed = Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt(build_confirm_prompt(picked))
-        .default(true)
+        .default(false)
         .interact()?;
     if !confirmed {
         writeln!(out, "Aborted.")?;

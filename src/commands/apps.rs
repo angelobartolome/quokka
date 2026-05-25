@@ -329,7 +329,11 @@ mod tui {
                     enrich_done = true;
                     state.computing = None;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+                // 250ms tick: forces a redraw even when nothing changed so
+                // the "computing… N/M" status text refreshes. 120ms before
+                // was overkill — the human eye doesn't notice the difference
+                // and at 4Hz instead of 8Hz the idle CPU cost halves.
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
         };
 

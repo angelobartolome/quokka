@@ -82,21 +82,8 @@ impl std::fmt::Display for YearMonth {
 /// Convert unix epoch seconds to (year, month) in UTC. Pure math —
 /// no chrono needed.
 fn epoch_to_year_month(unix_seconds: i64) -> YearMonth {
-    let days_since_epoch = unix_seconds.div_euclid(86_400);
-    // Civil-from-days algorithm (Howard Hinnant). Returns (year, month, day).
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y } as i32;
-    YearMonth {
-        year,
-        month: m as u32,
-    }
+    let (year, month, _, _, _, _) = crate::ui::civil_from_unix(unix_seconds);
+    YearMonth { year, month }
 }
 
 #[derive(Debug, Clone)]

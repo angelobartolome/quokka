@@ -8,8 +8,44 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use thiserror::Error;
 
 pub mod model_names;
+
+/// Typed device-layer errors. Surfacing these as a real `enum` (instead of
+/// stringly-typed `anyhow` everywhere) lets callers branch on the failure
+/// mode — "device not paired" needs a different hint than "iOS too old" or
+/// "AFC unreachable" or "service stalled". Currently used by the most
+/// user-facing failure paths; older sites still return `anyhow::Error`
+/// directly and are migrated opportunistically.
+#[derive(Debug, Error)]
+pub enum DeviceError {
+    #[error(
+        "device is not paired with this Mac — unlock the iPhone and tap 'Trust this computer'"
+    )]
+    NotPaired,
+
+    #[error("could not reach usbmuxd: {0}")]
+    Usbmuxd(String),
+
+    #[error("lockdown service unavailable: {0}")]
+    Lockdown(String),
+
+    #[error("AFC service unavailable: {0}")]
+    AfcUnreachable(String),
+
+    #[error("installation_proxy unavailable: {0}")]
+    InstallationProxy(String),
+
+    #[error("diagnostics_relay unavailable: {0}")]
+    DiagnosticsRelay(String),
+
+    #[error("syslog_relay unavailable: {0}")]
+    SyslogRelay(String),
+
+    #[error("{0}")]
+    Other(String),
+}
 
 /// Streaming update from [`Device::with_dynamic_sizes`] — one fires per
 /// batch as the device returns enriched sizes. `apps` carries only the
@@ -602,13 +638,9 @@ mod real {
 
     impl RealDevice {
         pub(super) async fn connect(target_udid: Option<&str>) -> Result<Self> {
-            use std::io::IsTerminal;
-            let mut usbmuxd = UsbmuxdConnection::default().await.map_err(|e| {
-                anyhow!(
-                    "Could not reach usbmuxd on this Mac ({e:?}). Make sure macOS sees the device \
-                     in Finder, then try again."
-                )
-            })?;
+            let mut usbmuxd = UsbmuxdConnection::default()
+                .await
+                .map_err(|e| anyhow::Error::from(DeviceError::Usbmuxd(format!("{e:?}"))))?;
 
             let devs = usbmuxd
                 .get_devices()
@@ -622,25 +654,17 @@ mod real {
                 ));
             }
 
-            // Prefer USB over Wi-Fi when both shapes of the same device are
-            // listed — Wi-Fi pairing is out of scope for the MVP.
-            let usb_devs: Vec<_> = devs
-                .iter()
-                .filter(|d| d.connection_type == Connection::Usb)
-                .collect();
-            let candidates: Vec<_> = if !usb_devs.is_empty() {
-                usb_devs
-            } else {
-                devs.iter().collect()
-            };
-
-            let chosen = if let Some(want) = target_udid {
-                candidates
-                    .iter()
+            use std::io::IsTerminal;
+            // When `--udid` is explicit, search every connected device
+            // regardless of transport — filtering to USB-only would hide a
+            // Wi-Fi device that the user explicitly targeted. Without an
+            // explicit UDID, prefer USB (Wi-Fi pairing is out of scope).
+            let chosen_udid: String = if let Some(want) = target_udid {
+                devs.iter()
                     .find(|d| d.udid == want)
-                    .copied()
+                    .map(|d| d.udid.clone())
                     .ok_or_else(|| {
-                        let available = candidates
+                        let available = devs
                             .iter()
                             .map(|d| d.udid.as_str())
                             .collect::<Vec<_>>()
@@ -650,22 +674,37 @@ mod real {
                              Run `qk devices` to see what's plugged in."
                         )
                     })?
-            } else if candidates.len() == 1 {
-                candidates[0]
-            } else if std::io::stderr().is_terminal() {
-                pick_device_interactively(&candidates).await?
             } else {
-                let udids = candidates
+                let usb_devs: Vec<_> = devs
                     .iter()
-                    .map(|d| d.udid.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(anyhow!(
-                    "{} iPhones connected. Pass --udid <UDID> (or set QK_UDID) to pick one. \
-                     Available: [{udids}]. Run `qk devices` to see names + models.",
-                    candidates.len()
-                ));
+                    .filter(|d| d.connection_type == Connection::Usb)
+                    .collect();
+                let candidates: Vec<_> = if !usb_devs.is_empty() {
+                    usb_devs
+                } else {
+                    devs.iter().collect()
+                };
+                if candidates.len() == 1 {
+                    candidates[0].udid.clone()
+                } else if std::io::stderr().is_terminal() {
+                    pick_device_interactively(&candidates).await?.udid.clone()
+                } else {
+                    let udids = candidates
+                        .iter()
+                        .map(|d| d.udid.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(anyhow!(
+                        "{} iPhones connected. Pass --udid <UDID> (or set QK_UDID) to pick one. \
+                         Available: [{udids}]. Run `qk devices` to see names + models.",
+                        candidates.len()
+                    ));
+                }
             };
+            let chosen = devs
+                .iter()
+                .find(|d| d.udid == chosen_udid)
+                .expect("chosen_udid was selected from devs above");
 
             let udid = chosen.udid.clone();
             let provider: Box<dyn IdeviceProvider> = Box::new(chosen.to_provider(
@@ -673,12 +712,10 @@ mod real {
                 "quokka",
             ));
 
-            let pairing = provider.get_pairing_file().await.map_err(|e| {
-                anyhow!(
-                    "No pairing file for this device ({e:?}). Unlock the iPhone and tap 'Trust \
-                     this computer'."
-                )
-            })?;
+            let pairing = provider
+                .get_pairing_file()
+                .await
+                .map_err(|_| anyhow::Error::from(DeviceError::NotPaired))?;
 
             Ok(Self {
                 provider,
@@ -881,7 +918,9 @@ mod real {
         async fn uninstall_app(&self, bundle_id: &str) -> Result<()> {
             let mut ip = InstallationProxyClient::connect(&*self.provider)
                 .await
-                .map_err(|e| anyhow!("Could not open installation_proxy ({e:?})"))?;
+                .map_err(|e| {
+                    anyhow::Error::from(DeviceError::InstallationProxy(format!("{e:?}")))
+                })?;
             ip.uninstall(bundle_id.to_string(), None)
                 .await
                 .map_err(|e| anyhow!("uninstall {bundle_id} failed: {e:?}"))
@@ -896,9 +935,9 @@ mod real {
         }
 
         async fn afc_delete(&self, path: &str) -> Result<()> {
-            let mut afc = AfcClient::connect(&*self.provider).await.map_err(|e| {
-                anyhow!("Could not open AFC ({e}). Unlock the iPhone and try again.")
-            })?;
+            let mut afc = AfcClient::connect(&*self.provider)
+                .await
+                .map_err(|e| anyhow::Error::from(DeviceError::AfcUnreachable(format!("{e}"))))?;
             afc.remove(path.to_string())
                 .await
                 .map_err(|e| anyhow!("delete {path} failed: {e}"))
@@ -911,7 +950,9 @@ mod real {
         async fn reboot(&self) -> Result<()> {
             let mut diag = DiagnosticsRelayClient::connect(&*self.provider)
                 .await
-                .map_err(|e| anyhow!("Could not open diagnostics_relay ({e:?})"))?;
+                .map_err(|e| {
+                    anyhow::Error::from(DeviceError::DiagnosticsRelay(format!("{e:?}")))
+                })?;
             diag.restart()
                 .await
                 .map_err(|e| anyhow!("reboot request failed: {e:?}"))
@@ -920,7 +961,9 @@ mod real {
         async fn shutdown(&self) -> Result<()> {
             let mut diag = DiagnosticsRelayClient::connect(&*self.provider)
                 .await
-                .map_err(|e| anyhow!("Could not open diagnostics_relay ({e:?})"))?;
+                .map_err(|e| {
+                    anyhow::Error::from(DeviceError::DiagnosticsRelay(format!("{e:?}")))
+                })?;
             diag.shutdown()
                 .await
                 .map_err(|e| anyhow!("shutdown request failed: {e:?}"))
@@ -929,11 +972,14 @@ mod real {
         async fn stream_logs(&self) -> Result<tokio::sync::mpsc::Receiver<Result<LogEntry>>> {
             let mut syslog = SyslogRelayClient::connect(&*self.provider)
                 .await
-                .map_err(|e| {
-                    anyhow!("Could not open syslog_relay ({e:?}). Is the device trusted?")
-                })?;
+                .map_err(|e| anyhow::Error::from(DeviceError::SyslogRelay(format!("{e:?}"))))?;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<LogEntry>>(1024);
-            tokio::spawn(async move {
+            // The stream task is fire-and-forget — but a panic inside it
+            // would just drop the channel without telling the receiver why.
+            // Catch the join handle's panic and surface it through the
+            // channel so the TUI/plain renderer can show "stream ended"
+            // with the panic message rather than silently going quiet.
+            let handle = tokio::spawn(async move {
                 // Continuation-aware: lines that start with whitespace
                 // append to the previous entry's message.
                 let mut pending: Option<LogEntry> = None;
@@ -963,6 +1009,16 @@ mod real {
                     let _ = tx.send(Ok(entry)).await;
                 }
             });
+            // Spawn a tiny watchdog that turns a panic into a logged
+            // message via stderr — receivers see the channel close, which
+            // is the existing "stream ended" path.
+            tokio::spawn(async move {
+                if let Err(join_err) = handle.await {
+                    if join_err.is_panic() {
+                        eprintln!("warning: syslog stream task panicked: {join_err}");
+                    }
+                }
+            });
             Ok(rx)
         }
     }
@@ -973,7 +1029,7 @@ mod real {
     ) -> Result<DeviceInfo> {
         let mut lock = LockdownClient::connect(provider)
             .await
-            .map_err(|e| anyhow!("Could not open lockdown ({e:?}). Is the device trusted?"))?;
+            .map_err(|e| anyhow::Error::from(DeviceError::Lockdown(format!("{e:?}"))))?;
         lock.start_session(pairing)
             .await
             .map_err(|e| anyhow!("Lockdown session failed: {e:?}"))?;
@@ -1044,7 +1100,7 @@ mod real {
         use std::time::{Duration, Instant};
         let mut afc = AfcClient::connect(provider)
             .await
-            .map_err(|e| anyhow!("Could not open AFC ({e}). Unlock the iPhone and try again."))?;
+            .map_err(|e| anyhow::Error::from(DeviceError::AfcUnreachable(format!("{e}"))))?;
 
         let mut files = Vec::new();
         let mut queue: std::collections::VecDeque<String> =
@@ -1125,7 +1181,7 @@ mod real {
     ) -> Result<Vec<App>> {
         let mut ip = InstallationProxyClient::connect(provider)
             .await
-            .map_err(|e| anyhow!("Could not open installation_proxy ({e:?})"))?;
+            .map_err(|e| anyhow::Error::from(DeviceError::InstallationProxy(format!("{e:?}"))))?;
 
         let mut opts = plist::Dictionary::new();
         opts.insert("ApplicationType".into(), Value::from(application_type));
@@ -1223,20 +1279,34 @@ mod real {
             next_batch += 1;
         }
 
+        // Collect per-batch errors but keep processing — losing one batch
+        // shouldn't throw away the progress the UI has already painted for
+        // the others. If every batch fails, surface the first error so the
+        // caller still gets a non-Ok return; otherwise warn and continue.
         let mut done = 0;
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+        let mut batches_completed = 0usize;
         while let Some(result) = in_flight.next().await {
-            let updated = result?;
-            done += updated.len();
-            for app in &updated {
-                if let Some(&i) = index.get(&app.bundle_id) {
-                    sorted[i] = app.clone();
+            match result {
+                Ok(updated) => {
+                    done += updated.len();
+                    for app in &updated {
+                        if let Some(&i) = index.get(&app.bundle_id) {
+                            sorted[i] = app.clone();
+                        }
+                    }
+                    on_batch(BatchUpdate {
+                        apps: updated,
+                        done: done.min(total),
+                        total,
+                    });
+                    batches_completed += 1;
+                }
+                Err(e) => {
+                    eprintln!("warning: app size enrichment batch failed: {e}");
+                    errors.push(e);
                 }
             }
-            on_batch(BatchUpdate {
-                apps: updated,
-                done: done.min(total),
-                total,
-            });
             if next_batch < batches.len() {
                 in_flight.push(lookup_apps(
                     provider,
@@ -1245,6 +1315,12 @@ mod real {
                     "Any",
                 ));
                 next_batch += 1;
+            }
+        }
+
+        if batches_completed == 0 {
+            if let Some(first) = errors.into_iter().next() {
+                return Err(first);
             }
         }
 
@@ -1308,7 +1384,7 @@ mod real {
         async fn read_lockdown_info(&self) -> Result<LockdownInfo> {
             let mut lock = LockdownClient::connect(&*self.provider)
                 .await
-                .map_err(|e| anyhow!("Could not open lockdown ({e:?}). Is the device trusted?"))?;
+                .map_err(|e| anyhow::Error::from(DeviceError::Lockdown(format!("{e:?}"))))?;
             lock.start_session(&self.pairing)
                 .await
                 .map_err(|e| anyhow!("Lockdown session failed: {e:?}"))?;
