@@ -14,37 +14,28 @@
 //!   that lies — we skip Ethernet entirely and parse from the IP layer,
 //!   letting etherparse pick IPv4/IPv6 from the first nibble.
 
-use std::borrow::Cow;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
-use pcap_file::pcap::{PcapPacket, PcapWriter};
-use pcap_file::pcapng::blocks::enhanced_packet::{EnhancedPacketBlock, EnhancedPacketOption};
-use pcap_file::pcapng::blocks::interface_description::InterfaceDescriptionBlock;
-use pcap_file::pcapng::PcapNgWriter;
-use pcap_file::DataLink;
 
 use crate::device::{Device, Packet, PacketStream};
 
-/// Offsets we try, in order, to locate the IP header inside `Packet::data`.
-///
-/// The idevice crate's `normalize_data()` only prepends the 14-byte
-/// synthetic Ethernet header when `frame_pre_length == 0`, and only
-/// strips the 4-byte BSD loopback prefix for `pdp_ip*` interfaces.
-/// Anything else (notably `utun*`, used by RemotePairing on iOS 17+)
-/// arrives raw — Ethernet not added, BSD loopback prefix not stripped.
-/// We don't have `frame_pre_length` at this layer, so we attempt parses
-/// at each plausible offset and accept the first one that succeeds.
-///
-/// Order matters for ambiguous payloads: 14 wins for the common case
-/// (en0, pdp_ip0 after normalization), then 4 for utun BSD-loopback
-/// framing, then 0 for raw IP as a last-resort.
-const IP_OFFSET_CANDIDATES: &[usize] = &[14, 4, 0];
+mod hosts;
+mod parser;
+mod pcap_io;
+mod style;
+mod tui;
+
+pub use hosts::{HostAggregator, HostStats};
+pub use parser::{
+    extract_sni, parse_dns_query, parse_summary, Direction, DnsQuery, Endpoint, ParsedPacket,
+    Protocol,
+};
+pub use pcap_io::{CaptureFile, SaveFormat};
+
+use parser::{try_extract_tcp_payload, try_extract_udp_payload};
 
 /// Interval between "X packets dropped" notices on stderr when drops are
 /// happening. Cheap enough that a quiet capture spends almost nothing on it.
@@ -74,22 +65,25 @@ pub struct Options {
     pub mode: Mode,
 }
 
-/// Output mode for `qk capture`. The four variants are mutually exclusive
-/// at the clap layer — combining them inside Phase 5 would mean splitting
-/// the renderer four ways, with no useful semantic.
+/// Output mode for `qk capture`. The four user-facing variants are
+/// mutually exclusive at the clap layer; [`Mode::Headless`] is internal
+/// to integration tests so they can drive the App's ingest path without
+/// requiring a TTY.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Default: per-packet line as in Phase 2 (timestamp, owner, proto,
-    /// endpoints, bytes), plus optional file output via `--save`.
+    /// Default: interactive TUI streaming per-packet rows. Stream view.
     #[default]
     Stream,
-    /// Aggregate by (process, remote IP:port). Periodically clears the
-    /// screen and reprints, top(1)-style. Ctrl-C prints the final snapshot.
+    /// Interactive TUI opened directly on the Hosts (aggregated) view.
     Hosts,
     /// Extract DNS queries from UDP/53 payloads. One line per query.
     Dns,
     /// Extract TLS SNI from TCP/443 ClientHellos. One line per hello.
     Sni,
+    /// Drain packets through the TUI's `App::ingest` without a terminal.
+    /// Not user-facing — integration tests select it to exercise the same
+    /// state machine the live TUI uses, without needing a TTY.
+    Headless,
 }
 
 /// AND-combined per-packet filters. Empty fields are wildcards.
@@ -177,7 +171,22 @@ impl Filter {
 }
 
 pub async fn run(device: &dyn Device, opts: Options) -> Result<()> {
+    use std::io::IsTerminal;
     use std::sync::atomic::Ordering;
+
+    // Stream / Hosts normally use the interactive TUI (Phase 6). DNS / SNI
+    // stay on the legacy line-based renderer — those modes are
+    // intentionally pipe-friendly and don't need a terminal. Headless
+    // also stays here as a test-only ingest drain.
+    //
+    // If stdout isn't a TTY (CI, pipe, `--max` smoke test, `--save` to
+    // file) we fall through to the line renderer for Stream/Hosts too,
+    // so the smoke-test and pipeline cases keep working without an
+    // interactive shell.
+    let tty = std::io::stdout().is_terminal();
+    if tty && matches!(opts.mode, Mode::Stream | Mode::Hosts) {
+        return tui::run(device, opts).await;
+    }
 
     let stream = device.capture_packets().await?;
     let mut writer = match &opts.save {
@@ -188,19 +197,14 @@ pub async fn run(device: &dyn Device, opts: Options) -> Result<()> {
         None => None,
     };
     match opts.mode {
-        Mode::Stream => {
-            if let Some(path) = &opts.save {
-                eprintln!(
-                    "Capturing packets to {}. Press Ctrl-C to stop.",
-                    path.display()
-                );
-            } else {
-                eprintln!("Capturing packets. Press Ctrl-C to stop.");
-            }
+        Mode::Stream => eprintln!("Capturing packets. Press Ctrl-C to stop."),
+        Mode::Hosts => {
+            eprintln!("Aggregating by process + host (top-style). Press Ctrl-C to stop.")
         }
-        Mode::Hosts => eprintln!("Aggregating hosts. Press Ctrl-C for a final snapshot."),
         Mode::Dns => eprintln!("Capturing DNS queries (UDP/53). Press Ctrl-C to stop."),
         Mode::Sni => eprintln!("Capturing TLS SNI (TCP/443). Press Ctrl-C to stop."),
+        // Headless is test-only — no stderr banner, no final summary.
+        Mode::Headless => {}
     }
 
     let started_at = std::time::Instant::now();
@@ -313,6 +317,10 @@ pub async fn run(device: &dyn Device, opts: Options) -> Result<()> {
                         }
                         None => false,
                     },
+                    // Headless drains packets through filter+parse only.
+                    // No stdout, no aggregator side-effect; --max still
+                    // counts so tests exit deterministically.
+                    Mode::Headless => true,
                 };
                 if handled {
                     count += 1;
@@ -334,246 +342,6 @@ pub async fn run(device: &dyn Device, opts: Options) -> Result<()> {
             }
         }
     }
-}
-
-/// Writes captured packets to a file in pcap or pcapng format. Buffered so
-/// short bursts don't hit the disk on every packet; the buffer flushes on
-/// `Drop` via the inner `BufWriter`.
-///
-/// Format choice is by file extension at [`CaptureFile::open`] time — see
-/// [`SaveFormat::from_path`].
-pub enum CaptureFile {
-    /// Classic pcap. No room for per-packet process info; the comm/pid
-    /// columns we render to stdout don't make it into the file.
-    Pcap(PcapWriter<BufWriter<File>>),
-    /// pcapng. Every packet gets an EPB `opt_comment` of the form
-    /// `pid=N comm=NAME iface=IFACE io=I` so Wireshark's `frame.comment`
-    /// filter (`frame.comment contains "Instagram"`) lights up.
-    PcapNg(PcapNgWriter<BufWriter<File>>),
-}
-
-/// Distinct enum (not just an extension check at the call site) so the
-/// classifier is testable in isolation and the format pick has a name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaveFormat {
-    Pcap,
-    PcapNg,
-}
-
-impl SaveFormat {
-    /// Pick a format from the file extension. `.pcap` → classic pcap;
-    /// anything else (including no extension) defaults to pcapng — pcapng
-    /// is strictly more capable, and we want the comment metadata by
-    /// default.
-    pub fn from_path(path: &Path) -> Self {
-        match path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("pcap") => SaveFormat::Pcap,
-            _ => SaveFormat::PcapNg,
-        }
-    }
-}
-
-impl CaptureFile {
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = BufWriter::new(File::create(path)?);
-        Ok(match SaveFormat::from_path(path) {
-            SaveFormat::Pcap => CaptureFile::Pcap(PcapWriter::new(file)?),
-            SaveFormat::PcapNg => {
-                let mut w = PcapNgWriter::new(file)?;
-                // pcapng requires at least one Interface Description Block
-                // before any Enhanced Packet Block. We only ever write
-                // Ethernet-link packets (pcapd's `normalize_data` makes
-                // sure of that), so a single IDB with linktype 1 covers
-                // everything we'll emit.
-                let idb = InterfaceDescriptionBlock {
-                    linktype: DataLink::ETHERNET,
-                    snaplen: 0xFFFF,
-                    options: vec![],
-                };
-                w.write_pcapng_block(idb)?;
-                CaptureFile::PcapNg(w)
-            }
-        })
-    }
-
-    pub fn write(&mut self, p: &Packet) -> Result<()> {
-        let ts = packet_timestamp(p);
-        let len = p.data.len() as u32;
-        match self {
-            CaptureFile::Pcap(w) => {
-                w.write_packet(&PcapPacket {
-                    timestamp: ts,
-                    orig_len: len,
-                    data: Cow::Borrowed(&p.data),
-                })?;
-            }
-            CaptureFile::PcapNg(w) => {
-                let comment = packet_comment(p);
-                let block = EnhancedPacketBlock {
-                    interface_id: 0,
-                    timestamp: ts,
-                    original_len: len,
-                    data: Cow::Borrowed(&p.data),
-                    options: vec![EnhancedPacketOption::Comment(Cow::Owned(comment))],
-                };
-                w.write_pcapng_block(block)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// pcapng EPB comment text — Wireshark surfaces this as `frame.comment`.
-/// Format is intentionally `key=value` pairs (not free text) so people can
-/// grep / filter on it after the fact.
-fn packet_comment(p: &Packet) -> String {
-    format!(
-        "pid={} comm={} iface={} io={}",
-        p.pid, p.comm, p.interface, p.io,
-    )
-}
-
-/// Build a `Duration` from pcapd's split seconds/microseconds fields. Used
-/// for both pcap (legacy μs resolution) and pcapng (which can carry higher
-/// resolution but we have none to give).
-fn packet_timestamp(p: &Packet) -> Duration {
-    Duration::from_secs(p.seconds as u64) + Duration::from_micros(p.microseconds as u64)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// Outbound, written from the device.
-    Out,
-    /// Inbound, received by the device.
-    In,
-}
-
-impl Direction {
-    /// Map the raw pcapd `io` byte. The upstream crate doesn't document the
-    /// semantics; we follow the convention used by macOS BPF (`PKTAP_FLAG_
-    /// DIR_OUT`-style) where `1` is outbound. **Validate empirically** with
-    /// known traffic and flip this if needed — the test suite locks in
-    /// whichever direction we commit to.
-    pub fn from_io_byte(io: u8) -> Self {
-        if io == 1 {
-            Direction::Out
-        } else {
-            Direction::In
-        }
-    }
-
-    fn arrow(self) -> &'static str {
-        match self {
-            Direction::Out => "↑",
-            Direction::In => "↓",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    Tcp,
-    Udp,
-    Icmp,
-    Other,
-}
-
-impl Protocol {
-    fn as_str(self) -> &'static str {
-        match self {
-            Protocol::Tcp => "TCP",
-            Protocol::Udp => "UDP",
-            Protocol::Icmp => "ICMP",
-            Protocol::Other => "OTHER",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Endpoint {
-    pub ip: IpAddr,
-    /// `None` for ICMP / "Other" — those have no L4 port concept here.
-    pub port: Option<u16>,
-}
-
-impl std::fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // IPv6 needs brackets to disambiguate the colon-separated port.
-        match (self.ip, self.port) {
-            (IpAddr::V6(v6), Some(p)) => write!(f, "[{v6}]:{p}"),
-            (IpAddr::V6(v6), None) => write!(f, "[{v6}]"),
-            (IpAddr::V4(v4), Some(p)) => write!(f, "{v4}:{p}"),
-            (IpAddr::V4(v4), None) => write!(f, "{v4}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ParsedPacket {
-    pub protocol: Protocol,
-    pub src: Endpoint,
-    pub dst: Endpoint,
-}
-
-/// Pure parsing function. Skips the synthetic 14-byte Ethernet header the
-/// idevice crate prepended, then lets etherparse decide IPv4 vs IPv6 by
-/// peeking at the IP version nibble. Returns `None` on any parse failure
-/// (truncated payload, unknown protocol, malformed header) — the caller
-/// is expected to fall back to a `<parse error>` line rather than crash.
-pub fn parse_summary(packet: &Packet) -> Option<ParsedPacket> {
-    let parsed = IP_OFFSET_CANDIDATES
-        .iter()
-        .filter(|&&off| packet.data.len() > off)
-        .find_map(|&off| SlicedPacket::from_ip(&packet.data[off..]).ok())?;
-
-    let (src_ip, dst_ip) = match parsed.net.as_ref()? {
-        NetSlice::Ipv4(s) => (
-            IpAddr::V4(s.header().source_addr()),
-            IpAddr::V4(s.header().destination_addr()),
-        ),
-        NetSlice::Ipv6(s) => (
-            IpAddr::V6(s.header().source_addr()),
-            IpAddr::V6(s.header().destination_addr()),
-        ),
-        // etherparse may add new NetSlice variants (e.g. ARP); treat them
-        // as unparseable rather than guessing.
-        _ => return None,
-    };
-
-    let (protocol, src_port, dst_port) = match parsed.transport.as_ref() {
-        Some(TransportSlice::Tcp(t)) => (
-            Protocol::Tcp,
-            Some(t.source_port()),
-            Some(t.destination_port()),
-        ),
-        Some(TransportSlice::Udp(u)) => (
-            Protocol::Udp,
-            Some(u.source_port()),
-            Some(u.destination_port()),
-        ),
-        Some(TransportSlice::Icmpv4(_)) | Some(TransportSlice::Icmpv6(_)) => {
-            (Protocol::Icmp, None, None)
-        }
-        // Unknown transport (or none) — still useful to log src/dst IP.
-        _ => (Protocol::Other, None, None),
-    };
-
-    Some(ParsedPacket {
-        protocol,
-        src: Endpoint {
-            ip: src_ip,
-            port: src_port,
-        },
-        dst: Endpoint {
-            ip: dst_ip,
-            port: dst_port,
-        },
-    })
 }
 
 /// PID sentinel pcapd uses when the kernel attributes the packet to no
@@ -692,34 +460,6 @@ fn render_sni_line(p: &Packet, parsed: Option<&ParsedPacket>) -> Option<String> 
     Some(format!("{time}  {owner:<22}  {sni}"))
 }
 
-/// Walk the same offset candidates as [`parse_summary`], stopping at the
-/// first slice that decodes as UDP, and return the L7 payload.
-fn try_extract_udp_payload(p: &Packet) -> Option<&[u8]> {
-    for &off in IP_OFFSET_CANDIDATES {
-        let slice = p.data.get(off..)?;
-        if let Ok(parsed) = SlicedPacket::from_ip(slice) {
-            if let Some(TransportSlice::Udp(udp)) = parsed.transport {
-                return Some(udp.payload());
-            }
-        }
-    }
-    None
-}
-
-/// Same shape as [`try_extract_udp_payload`] but for TCP. Returns the
-/// segment payload (post-options), which is what TLS ClientHello sits in.
-fn try_extract_tcp_payload(p: &Packet) -> Option<&[u8]> {
-    for &off in IP_OFFSET_CANDIDATES {
-        let slice = p.data.get(off..)?;
-        if let Ok(parsed) = SlicedPacket::from_ip(slice) {
-            if let Some(TransportSlice::Tcp(tcp)) = parsed.transport {
-                return Some(tcp.payload());
-            }
-        }
-    }
-    None
-}
-
 /// Header line for the `--hosts` snapshot. Format follows the spec
 /// example: `Last update: HH:MM:SS (capturing for Xm Ys)`.
 fn hosts_header(started_at: std::time::Instant) -> String {
@@ -730,8 +470,11 @@ fn hosts_header(started_at: std::time::Instant) -> String {
     let hh = (secs / 3600) % 24;
     let mm = (secs / 60) % 60;
     let ss = secs % 60;
+    // UTC suffix is explicit so users in non-UTC timezones can't confuse
+    // this header with their local wall clock (C5 from the Phase 6 review).
+    // Pulling chrono/time just for this is heavier than the bug warrants.
     format!(
-        "Last update: {hh:02}:{mm:02}:{ss:02} (capturing for {elapsed})",
+        "Last update: {hh:02}:{mm:02}:{ss:02} UTC (capturing for {elapsed})",
         elapsed = format_elapsed(started_at.elapsed()),
     )
 }
@@ -747,262 +490,18 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 5 aggregation modes — DNS queries, TLS SNI, per-host stats.
-// Each parser is a pure function so the test suite can drive them with
-// hand-crafted fixtures (no fake device round-trip).
-// ---------------------------------------------------------------------------
-
-/// One parsed DNS query — only the bits the `--dns` renderer needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsQuery {
-    /// Record type as a string (`"A"`, `"AAAA"`, `"PTR"`, ...). Unknown
-    /// codes render as `"TYPE<n>"` so we don't drop the line silently.
-    pub qtype: String,
-    /// Fully-qualified-ish name, dot-joined from the wire labels.
-    pub qname: String,
-}
-
-/// Parse a UDP payload as a DNS *query* message. Returns `None` for
-/// responses, malformed packets, or anything that doesn't look like DNS.
-pub fn parse_dns_query(payload: &[u8]) -> Option<DnsQuery> {
-    // RFC 1035 §4.1.1 — fixed 12-byte header.
-    if payload.len() < 12 {
-        return None;
-    }
-    // Flags: QR bit is the top bit of byte 2. We only want queries (0).
-    let qr_is_response = payload[2] & 0x80 != 0;
-    if qr_is_response {
-        return None;
-    }
-    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-    if qdcount == 0 {
-        return None;
-    }
-    let mut idx = 12usize;
-    let qname = read_dns_name(payload, &mut idx, 0)?;
-    if idx + 4 > payload.len() {
-        return None;
-    }
-    let qtype = u16::from_be_bytes([payload[idx], payload[idx + 1]]);
-    Some(DnsQuery {
-        qtype: dns_qtype_name(qtype),
-        qname,
-    })
-}
-
-/// Walk a DNS name with bounded compression-pointer recursion. The depth
-/// guard keeps a malicious or buggy packet from looping forever via
-/// pointers that reference each other.
-fn read_dns_name(buf: &[u8], idx: &mut usize, depth: u8) -> Option<String> {
-    if depth > 5 {
-        return None;
-    }
-    let mut labels: Vec<String> = Vec::new();
-    loop {
-        if *idx >= buf.len() {
-            return None;
-        }
-        let len = buf[*idx];
-        if len == 0 {
-            *idx += 1;
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            // Pointer: two bottom bits of `len` + next byte = absolute
-            // offset within the message. Pointers don't usually appear in
-            // queries, but we handle them defensively.
-            if *idx + 1 >= buf.len() {
-                return None;
-            }
-            let offset = (((len & 0x3F) as usize) << 8) | (buf[*idx + 1] as usize);
-            *idx += 2;
-            let mut sub = offset;
-            let tail = read_dns_name(buf, &mut sub, depth + 1)?;
-            labels.push(tail);
-            break;
-        }
-        let len = len as usize;
-        *idx += 1;
-        if *idx + len > buf.len() {
-            return None;
-        }
-        let label = std::str::from_utf8(&buf[*idx..*idx + len]).ok()?;
-        labels.push(label.to_string());
-        *idx += len;
-    }
-    Some(labels.join("."))
-}
-
-fn dns_qtype_name(t: u16) -> String {
-    match t {
-        1 => "A".into(),
-        2 => "NS".into(),
-        5 => "CNAME".into(),
-        6 => "SOA".into(),
-        12 => "PTR".into(),
-        15 => "MX".into(),
-        16 => "TXT".into(),
-        28 => "AAAA".into(),
-        33 => "SRV".into(),
-        65 => "HTTPS".into(),
-        257 => "CAA".into(),
-        other => format!("TYPE{other}"),
-    }
-}
-
-/// Extract SNI hostname from a TCP payload that starts with a TLS record.
-/// Returns `None` for non-TLS payloads, non-ClientHello records, or any
-/// truncation that prevents reading the SNI extension.
-///
-/// Hand-rolled instead of pulling in `tls-parser` (heavy, parses things
-/// we don't need). RFC 8446 §4.1.2 + RFC 6066 §3 cover the format.
-pub fn extract_sni(payload: &[u8]) -> Option<String> {
-    // TLS record: ContentType(1) ProtocolVersion(2) Length(2) Fragment(N).
-    if payload.len() < 5 || payload[0] != 22 {
-        return None;
-    }
-    let hs = payload.get(5..)?;
-    // Handshake message: msg_type(1) length(3) ClientHello{...}.
-    if hs.len() < 4 || hs[0] != 1 {
-        return None;
-    }
-    let body = hs.get(4..)?;
-    // ClientHello: version(2) random(32) session_id<u8> cipher_suites<u16>
-    // compression_methods<u8> extensions<u16>.
-    let mut i = 2 + 32;
-    let sid_len = *body.get(i)? as usize;
-    i = i.checked_add(1)?.checked_add(sid_len)?;
-    let cs_len = u16::from_be_bytes([*body.get(i)?, *body.get(i + 1)?]) as usize;
-    i = i.checked_add(2)?.checked_add(cs_len)?;
-    let cm_len = *body.get(i)? as usize;
-    i = i.checked_add(1)?.checked_add(cm_len)?;
-    let ext_total = u16::from_be_bytes([*body.get(i)?, *body.get(i + 1)?]) as usize;
-    i = i.checked_add(2)?;
-    let end = (i.checked_add(ext_total)?).min(body.len());
-    while i + 4 <= end {
-        let ext_type = u16::from_be_bytes([body[i], body[i + 1]]);
-        let ext_len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
-        i += 4;
-        if ext_type == 0 {
-            // server_name extension: list_len(u16) [name_type(u8)
-            // host_name<u16>]
-            if i + 2 > end {
-                return None;
-            }
-            let _list_len = u16::from_be_bytes([body[i], body[i + 1]]);
-            i += 2;
-            if i + 3 > end || body[i] != 0 {
-                return None;
-            }
-            let name_len = u16::from_be_bytes([body[i + 1], body[i + 2]]) as usize;
-            i += 3;
-            if i + name_len > end {
-                return None;
-            }
-            return std::str::from_utf8(&body[i..i + name_len])
-                .ok()
-                .map(str::to_string);
-        }
-        i += ext_len;
-    }
-    None
-}
-
-/// In-memory per-process / per-remote-host stats for `--hosts`.
-///
-/// Keys are sorted (`BTreeMap`) so the rendered output is stable across
-/// refreshes — process X always lands above process Y, host A always
-/// above B. Stable order matters more than insertion order for a top-
-/// style display.
-#[derive(Debug, Default)]
-pub struct HostAggregator {
-    per_proc: std::collections::BTreeMap<
-        (u32, String),
-        std::collections::BTreeMap<(std::net::IpAddr, u16), HostStats>,
-    >,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HostStats {
-    pub pkts: u64,
-    pub bytes_out: u64,
-    pub bytes_in: u64,
-}
-
-impl HostAggregator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record one packet. `parsed` must come from a successful parse —
-    /// hosts mode skips parse-failures (no remote IP to bucket on).
-    pub fn add(&mut self, p: &Packet, parsed: &ParsedPacket) {
-        let dir = Direction::from_io_byte(p.io);
-        let remote = match dir {
-            Direction::Out => &parsed.dst,
-            Direction::In => &parsed.src,
-        };
-        let Some(port) = remote.port else {
-            return;
-        };
-        let key = (p.pid, p.comm.clone());
-        let stats = self
-            .per_proc
-            .entry(key)
-            .or_default()
-            .entry((remote.ip, port))
-            .or_default();
-        stats.pkts += 1;
-        let bytes = p.data.len() as u64;
-        match dir {
-            Direction::Out => stats.bytes_out += bytes,
-            Direction::In => stats.bytes_in += bytes,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.per_proc.is_empty()
-    }
-
-    /// Render a snapshot. `header_line` lets the live renderer prepend a
-    /// "Last update: HH:MM:SS (capturing for ...)" line consistent with
-    /// the spec example.
-    pub fn render(&self, header_line: &str) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        let _ = writeln!(out, "{header_line}");
-        let _ = writeln!(out);
-        for ((pid, comm), hosts) in &self.per_proc {
-            let owner = owner_label(*pid, comm);
-            let _ = writeln!(out, "{owner}");
-            // Sort hosts by descending traffic so the heavy hitters lead.
-            let mut rows: Vec<_> = hosts.iter().collect();
-            rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.bytes_out + s.bytes_in));
-            for ((ip, port), stats) in rows {
-                let endpoint = Endpoint {
-                    ip: *ip,
-                    port: Some(*port),
-                };
-                let _ = writeln!(
-                    out,
-                    "  {endpoint:<24}  {pkts} pkts   {out_h} out  /  {in_h} in",
-                    pkts = stats.pkts,
-                    out_h = crate::ui::format_bytes(stats.bytes_out),
-                    in_h = crate::ui::format_bytes(stats.bytes_in),
-                );
-            }
-            let _ = writeln!(out);
-        }
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use etherparse::PacketBuilder;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use pcap_file::pcap::PcapWriter;
+    use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketOption;
+    use std::fs::File;
+    use std::io::BufWriter;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::Path;
+
+    use super::pcap_io::packet_comment;
 
     /// Build a [`Packet`] whose `data` mimics what the device layer hands
     /// us: 14 bytes of synthetic Ethernet header followed by the real
@@ -1010,8 +509,8 @@ mod tests {
     /// `parse_summary` skips them and reads from byte 14 onward.
     fn packet_with_payload(io: u8, comm: &str, payload: Vec<u8>) -> Packet {
         // 14 bytes of synthetic Ethernet header — the most common offset
-        // candidate in [`IP_OFFSET_CANDIDATES`]. Tests stay anchored on
-        // the en0 path; utun coverage lives in a dedicated test below.
+        // candidate. Tests stay anchored on the en0 path; utun coverage
+        // lives in a dedicated test below.
         let mut data = vec![0u8; 14];
         data.extend_from_slice(&payload);
         Packet {

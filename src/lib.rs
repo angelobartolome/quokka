@@ -188,9 +188,12 @@ enum Command {
         /// matches `utun0`, `utun4`, etc.
         #[arg(long, value_name = "NAME")]
         interface: Option<String>,
-        /// Aggregate by process + remote host. Periodically clears the
-        /// screen and reprints (top-style). Ctrl-C prints the final
-        /// snapshot.
+        /// Start the capture TUI on the Hosts view, which aggregates
+        /// packets by process + remote host. Toggle back to the Stream
+        /// view with Tab. On exit (q or `--max`) the final snapshot is
+        /// printed to stdout so it survives the alt-screen restore.
+        /// In non-TTY runs (pipes, CI) falls back to a top-style line
+        /// renderer that reprints the snapshot every few seconds.
         #[arg(long, conflicts_with_all = ["dns", "sni", "save"])]
         hosts: bool,
         /// Extract DNS queries from UDP port 53 only. One line per query.

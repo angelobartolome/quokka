@@ -1,0 +1,34 @@
+---
+source: src/commands/capture/tui.rs
+expression: out
+---
+qk capture · 3 pkts · 0 dropped · 0:00 · [Stream | Hosts]
+Filters: (none)
+Time         Dir Process              Proto Src                   →   Dst                   Bytes
+12:34:56.789 ↑   Instagram (4521)     TCP   192.168.1.42:54321    →   31.13.65.36:443       54 B
+12:34:56.789 ↓   Instagram (4521)     TCP   192.168.1.42:54321    →   31.13.65.36:443       54 B
+12:34:56.789 ↑   mDNSResponder (198)  UDP   192.168.1.42:5353     →   1.1.1.1:53            42 B
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Selected packet
+Process:   Instagram (4521)
+Direction: outbound on en0
+Endpoints: 192.168.1.42:54321 → 31.13.65.36:443
+Protocol:  tcp, 54 bytes
+Comment:   pid=4521 comm=Instagram iface=en0 io=1
+
+[a]pp [p]roto [P]ort [i]face [d]pid [c]lear [q]uit

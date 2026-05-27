@@ -669,7 +669,11 @@ async fn capture_run_respects_max_and_returns_ok() {
             max: Some(5),
             save: None,
             filter: Default::default(),
-            mode: Default::default(),
+            // Phase 6.4: Stream/Hosts route through the interactive TUI
+            // (which needs a real terminal). Headless drives the same
+            // ingest path without one, so the assertion still proves
+            // run() exits cleanly under --max.
+            mode: quokka_cli::commands::capture::Mode::Headless,
         },
     )
     .await;
@@ -690,7 +694,7 @@ async fn capture_run_exits_when_stream_closes_without_max() {
             max: None,
             save: None,
             filter: Default::default(),
-            mode: Default::default(),
+            mode: quokka_cli::commands::capture::Mode::Headless,
         },
     )
     .await;
@@ -699,8 +703,9 @@ async fn capture_run_exits_when_stream_closes_without_max() {
 
 #[tokio::test]
 async fn capture_run_hosts_mode_terminates_cleanly() {
-    // Hosts aggregator + Stream exit on stream close — verify the mode
-    // dispatch wires through without panicking when the channel ends.
+    // Headless covers the Hosts dispatch path the same way it covers
+    // Stream — the only difference at this layer is the App's initial
+    // view, which isn't observable without rendering.
     let fake = quokka_cli::device::FakeDevice {
         seeded_packets: vec![Ok(sample_pkt(1, "x", "en0", 64))],
         ..Default::default()
@@ -711,7 +716,7 @@ async fn capture_run_hosts_mode_terminates_cleanly() {
             max: None,
             save: None,
             filter: Default::default(),
-            mode: quokka_cli::commands::capture::Mode::Hosts,
+            mode: quokka_cli::commands::capture::Mode::Headless,
         },
     )
     .await;
@@ -765,7 +770,7 @@ async fn capture_run_with_app_filter_does_not_crash_on_misses() {
                 app: Some("instagram".into()),
                 ..Default::default()
             },
-            mode: Default::default(),
+            mode: quokka_cli::commands::capture::Mode::Headless,
         },
     )
     .await;

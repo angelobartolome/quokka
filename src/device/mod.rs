@@ -667,14 +667,27 @@ impl Device for FakeDevice {
     }
 
     async fn capture_packets(&self) -> Result<PacketStream> {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc::error::TrySendError;
+
+        // Match RealDevice's try_send + drop-counter semantics so tests
+        // that observe `PacketStream::dropped` against the fake see the
+        // same accounting they'd see against a real iPhone (C14 from the
+        // Phase 6 review). Awaiting `send` would back-pressure the
+        // producer and keep `dropped` at zero, masking real drop bugs.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Packet>>(64);
         let packets = self.seeded_packets.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped_for_task = dropped.clone();
         tokio::spawn(async move {
             for pkt in packets {
                 let result = pkt.map_err(|e| anyhow!(e));
-                if tx.send(result).await.is_err() {
-                    break;
+                match tx.try_send(result) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        dropped_for_task.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -817,7 +830,7 @@ mod real {
                     .0
                     .as_deref()
                     .unwrap_or("(untrusted — tap Trust on the device)");
-                let model = ident.1.as_deref().unwrap_or("?");
+                let model = ident.2.as_deref().or(ident.1.as_deref()).unwrap_or("?");
                 format!("{name}  ·  {model}  ·  {conn}  ·  {}", d.udid)
             })
             .collect();
@@ -832,14 +845,14 @@ mod real {
     }
 
     /// Brief lockdown probe of every candidate to fetch DeviceName +
-    /// ProductType. Returns `(name, friendly_model)` per device, falling
-    /// back to `None` when the device isn't paired/trusted yet.
+    /// ProductType. Returns `(name, model_identifier, model_friendly)` per
+    /// device, falling back to `None` when the device isn't paired/trusted yet.
     async fn enrich_candidates(
         candidates: &[&idevice::usbmuxd::UsbmuxdDevice],
-    ) -> Vec<(Option<String>, Option<String>)> {
+    ) -> Vec<(Option<String>, Option<String>, Option<String>)> {
         let addr = match UsbmuxdAddr::from_env_var() {
             Ok(a) => a,
-            Err(_) => return vec![(None, None); candidates.len()],
+            Err(_) => return vec![(None, None, None); candidates.len()],
         };
         let mut out = Vec::with_capacity(candidates.len());
         for d in candidates {
@@ -851,9 +864,9 @@ mod real {
 
     async fn read_identity_quick(
         provider: &dyn IdeviceProvider,
-    ) -> (Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let Ok(mut lock) = LockdownClient::connect(provider).await else {
-            return (None, None);
+            return (None, None, None);
         };
         let pairing = provider.get_pairing_file().await.ok();
         if let Some(p) = pairing.as_ref() {
@@ -873,7 +886,7 @@ mod real {
             .as_deref()
             .and_then(model_names::friendly_name)
             .map(String::from);
-        (name, friendly.or(model))
+        (name, model, friendly)
     }
 
     pub(super) async fn list_devices_impl() -> Result<Vec<DeviceListing>> {
@@ -887,14 +900,7 @@ mod real {
         let refs: Vec<&_> = devs.iter().collect();
         let identities = enrich_candidates(&refs).await;
         let mut out = Vec::with_capacity(devs.len());
-        for (d, (name, friendly)) in devs.iter().zip(identities) {
-            // `friendly` may already be the raw model id when no marketing
-            // name resolved; surface it as both fields then.
-            let model_identifier = friendly.clone();
-            let model_friendly = friendly
-                .as_deref()
-                .and_then(model_names::friendly_name)
-                .map(String::from);
+        for (d, (name, model_identifier, model_friendly)) in devs.iter().zip(identities) {
             out.push(DeviceListing {
                 udid: d.udid.clone(),
                 connection: if d.connection_type == Connection::Usb {
@@ -1116,32 +1122,42 @@ mod real {
             let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let dropped_for_task = dropped.clone();
             tokio::spawn(async move {
+                // Race `next_packet` against the receiver being dropped so
+                // the pcapd lockdown service is released as soon as the
+                // consumer exits — without this select! the task would
+                // stay blocked on next_packet().await until pcapd happened
+                // to deliver another frame, leaving the service handle
+                // open and racing a second `qk capture` invocation (C15).
                 loop {
-                    match client.next_packet().await {
-                        Ok(p) => {
-                            let pkt = Packet {
-                                pid: p.pid,
-                                comm: p.comm,
-                                epid: p.epid,
-                                ecomm: p.ecomm,
-                                interface: p.interface_name,
-                                seconds: p.seconds,
-                                microseconds: p.microseconds,
-                                io: p.io,
-                                data: p.data,
-                            };
-                            match tx.try_send(Ok(pkt)) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) => {
-                                    dropped_for_task.fetch_add(1, Ordering::Relaxed);
+                    tokio::select! {
+                        biased;
+                        _ = tx.closed() => break,
+                        next = client.next_packet() => match next {
+                            Ok(p) => {
+                                let pkt = Packet {
+                                    pid: p.pid,
+                                    comm: p.comm,
+                                    epid: p.epid,
+                                    ecomm: p.ecomm,
+                                    interface: p.interface_name,
+                                    seconds: p.seconds,
+                                    microseconds: p.microseconds,
+                                    io: p.io,
+                                    data: p.data,
+                                };
+                                match tx.try_send(Ok(pkt)) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        dropped_for_task.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(TrySendError::Closed(_)) => break,
                                 }
-                                Err(TrySendError::Closed(_)) => break,
                             }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(anyhow!("pcapd stream ended: {e:?}"))).await;
-                            break;
-                        }
+                            Err(e) => {
+                                let _ = tx.send(Err(anyhow!("pcapd stream ended: {e:?}"))).await;
+                                break;
+                            }
+                        },
                     }
                 }
             });

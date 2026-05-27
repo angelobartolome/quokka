@@ -12,7 +12,7 @@ use crossterm::{cursor, execute, terminal};
 use dialoguer::{theme::ColorfulTheme, Select};
 use owo_colors::OwoColorize;
 
-use crate::commands::{analyze, apps, dashboard, info, logs, media, power};
+use crate::commands::{analyze, apps, capture, dashboard, info, logs, media, power};
 use crate::device::Device;
 use crate::ui::{now_unix, spinner, terminal_width};
 
@@ -25,6 +25,7 @@ enum Choice {
     Analyze,
     Media,
     Logs,
+    Capture,
     Info,
     Refresh,
     Reboot,
@@ -64,6 +65,7 @@ pub async fn run(device: &dyn Device) -> Result<()> {
             ("Analyze", "Find the heaviest media files", Choice::Analyze),
             ("Media", "Survey camera roll & downloads", Choice::Media),
             ("Logs", "Stream device syslog", Choice::Logs),
+            ("Capture", "Stream network packets per app", Choice::Capture),
             ("Info", "Print device identity", Choice::Info),
             ("Refresh", "Re-read device info", Choice::Refresh),
             ("Reboot", "Restart the device", Choice::Reboot),
@@ -106,6 +108,7 @@ pub async fn run(device: &dyn Device) -> Result<()> {
             Choice::Analyze => analyze::run(device, 20, true).await?,
             Choice::Media => media::run(device, false).await?,
             Choice::Logs => logs::run(device, logs::Options::default()).await?,
+            Choice::Capture => capture::run(device, capture::Options::default()).await?,
             Choice::Info => info::run(device, false, false).await?,
             Choice::Reboot => power::run(device, power::Action::Reboot, false).await?,
             Choice::Shutdown => power::run(device, power::Action::Shutdown, false).await?,

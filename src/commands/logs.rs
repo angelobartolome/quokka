@@ -77,7 +77,15 @@ fn level_rank(level: LogLevel) -> u8 {
 }
 
 pub fn format_plain(entry: &LogEntry) -> String {
-    let ts = format_iso8601(entry.timestamp_unix_ms);
+    // Prefer the syslog HH:MM:SS slice the parser captured — the device
+    // doesn't hand us a full ISO timestamp, and falling back to "-" left
+    // every plain-mode line looking like the timestamp column had failed.
+    // ISO formatter is kept for the future when timestamp_unix_ms gets
+    // populated.
+    let ts = entry
+        .time_text
+        .clone()
+        .unwrap_or_else(|| format_iso8601(entry.timestamp_unix_ms));
     let proc = match entry.pid {
         Some(pid) => format!("{}[{pid}]", entry.process),
         None => entry.process.clone(),
